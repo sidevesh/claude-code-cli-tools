@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""claude-remote-launch - open a new terminal window running Claude Code in a
+directory, skipping the workspace trust prompt.
+
+Usage:
+  claude-remote-launch [DIR] [-- claude args...]
+  claude-remote-launch ~/Projects/foo --model opus
+  claude-remote-launch --profile work ~/Projects/foo
+  CLAUDE_CONFIG_DIR=~/.claude-work claude-remote-launch ~/Projects/foo
+
+Profiles are a naming convention: "default" is ~/.claude, any other name X is
+~/.claude-X. Nothing to register.
+
+Shell integration - add to ~/.bashrc or ~/.zshrc:
+      eval "$(claude-remote-launch --shell-init)"
+  That defines claude-<name> and claude-remote-launch-<name> for every profile
+  found. Create a profile directory and the aliases appear in your next shell.
+
+Options:
+  --profiles        list config profiles and exit
+  --list            list known projects by last-active, and exit
+  --shell-init      print per-profile alias definitions for eval, then exit
+  --profile NAME    e.g. default or work  (else honours $CLAUDE_CONFIG_DIR)
+  --terminal NAME   force a terminal emulator (else $CLAUDE_TERMINAL, else auto)
+  -n, --name NAME   override the session name
+  --no-name         don't name the session at all
+  --dry-run         print what would run, change nothing
+  --update [--check]  update both commands and the shared module; --check only
+                      reports whether an update exists. -y / --yes skips the
+                      prompt (or set CLAUDE_CLI_TOOLS_ASSUME_YES=1).
+  -v, --version     print version and exit
+  -h, --help
+
+Sessions are auto-named '<dir> (<user>@<host>)' via `claude -n`, which sets the
+name in the prompt box, the /resume picker, the terminal title, and the Remote
+Control session list. Passing your own -n in the claude args wins.
+
+Every session is launched with `--remote-control`. When no name was given (no
+-n/--name and no --no-name), the same generated name is also passed as
+`--remote-control`'s argument. Otherwise `--remote-control` is passed bare and
+claude's own defaults apply - your own name if you gave one, else its
+hostname-prefixed auto name.
+
+Why not --dangerously-skip-permissions: it does suppress the trust dialog, but
+it also disables every tool-permission check for the session. Claude Code has no
+interactive --trust flag (the dialog is only auto-skipped in non-interactive -p
+mode), so the supported route is the per-project hasTrustDialogAccepted key.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+
+# Locate the shared module. bin/ goes on PATH and must hold only executables,
+# so the module lives in a sibling lib/ - either <prefix>/lib/claude-code-cli-tools
+# (installed) or <repo>/lib (git checkout). realpath() resolves symlinks first.
+# Don't leave a __pycache__ beside the installed module: the install is meant
+# to be exactly three files. The module is small, so recompiling each run is
+# cheaper than the clutter.
+sys.dont_write_bytecode = True
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_prefix = os.path.dirname(_here)
+for _cand in (os.path.join(_prefix, "lib", "claude-code-cli-tools"),
+              os.path.join(_prefix, "lib"),
+              os.path.expanduser("~/.local/lib/claude-code-cli-tools")):
+    if os.path.isfile(os.path.join(_cand, "claude_profile_lib.py")):
+        sys.path.insert(0, _cand)
+        break
+else:
+    sys.stderr.write("error: claude_profile_lib.py not found; reinstall\n")
+    raise SystemExit(1)
+from claude_profile_lib import (  # noqa: E402
+    __version__, config_dir, config_json_path, die, do_update, print_profiles,
+    print_projects, print_shell_init, resolve_dir, trust_dir,
+)
+
+try:
+    from shlex import quote as shq
+except ImportError:  # py2-era fallback, harmless
+    from pipes import quote as shq  # type: ignore
+
+
+# Terminals that take a working-dir flag and then a command. The command is also
+# `cd`-ed into inside the shell, so the flag is belt-and-braces for the ones
+# whose flag is unreliable.
+LINUX_TERMINALS = [
+    ("kgx",            lambda d: ["--working-directory", d, "--"]),
+    ("ptyxis",         lambda d: ["--working-directory", d, "--"]),
+    ("gnome-terminal", lambda d: ["--working-directory", d, "--"]),
+    ("tilix",          lambda d: ["--working-directory", d, "-e"]),
+    ("konsole",        lambda d: ["--workdir", d, "-e"]),
+    ("alacritty",      lambda d: ["--working-directory", d, "-e"]),
+    ("kitty",          lambda d: ["--directory", d]),
+    ("wezterm",        lambda d: ["start", "--cwd", d, "--"]),
+    ("foot",           lambda d: ["--working-directory", d]),
+    ("xfce4-terminal", lambda d: ["--working-directory", d, "-x"]),
+    ("xterm",          lambda d: ["-e"]),
+]
+
+
+def session_name(directory):
+    """'<dir> (<user>@<host>)', e.g. 'my-app (alice@workstation)'.
+
+    Passed to `claude -n`, which names the session in the prompt box, the
+    /resume picker, the terminal title, and the Remote Control session list.
+    Without a name, sessions get auto-generated ones like 'Websites [2f4a9f]',
+    which are hard to tell apart when several machines are connected.
+    """
+    import getpass
+    import socket
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = os.environ.get("USER") or os.environ.get("LOGNAME") or "user"
+    # socket.gethostname() needs no `hostname` binary - minimal installs omit it.
+    host = (socket.gethostname() or "localhost").split(".")[0]
+    return "%s (%s@%s)" % (os.path.basename(directory.rstrip("/")) or "/", user, host)
+
+
+def has_name_arg(args):
+    for a in args:
+        if a in ("-n", "--name") or a.startswith("--name="):
+            return True
+    return False
+
+
+def has_remote_control_arg(args):
+    for a in args:
+        if a == "--remote-control" or a.startswith("--remote-control="):
+            return True
+    return False
+
+
+def login_shell():
+    """A shell that understands -l -c. fish does not, so fall back to bash."""
+    sh = os.environ.get("SHELL") or ""
+    base = os.path.basename(sh)
+    if base in ("bash", "zsh", "sh", "ksh", "dash"):
+        return sh
+    for cand in ("/bin/bash", "/bin/zsh", "/bin/sh"):
+        if os.path.exists(cand):
+            return cand
+    return "/bin/sh"
+
+
+def applescript_quote(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def build_inner(directory, claude_args, env_prefix, use_exec):
+    """Shell one-liner for the new window.
+
+    env assignments must be `export`ed on their own, not prefixed onto `cd`:
+    `VAR=x cd dir && claude` applies VAR to the cd builtin and never reaches
+    claude. `use_exec` replaces the wrapper shell on Linux; macOS's `do script`
+    wants a plain command it can keep a window around for.
+    """
+    parts = ["claude"] + [shq(a) for a in claude_args]
+    run = " ".join(parts)
+    if use_exec:
+        run = "exec " + run
+    cmd = "cd %s && %s" % (shq(directory), run)
+    if env_prefix:
+        cmd = "%s; %s" % (env_prefix, cmd)
+    return cmd
+
+
+def pick_terminal(forced):
+    if forced:
+        if forced in ("Terminal", "iTerm") or shutil.which(forced):
+            return forced
+        die("terminal %r not found on PATH" % forced)
+    if sys.platform == "darwin":
+        if os.path.isdir("/Applications/iTerm.app"):
+            return "iTerm"
+        return "Terminal"
+    for name, _ in LINUX_TERMINALS:
+        if shutil.which(name):
+            return name
+    die("no supported terminal emulator found; set --terminal or $CLAUDE_TERMINAL")
+
+
+def build_argv(term, directory, env_prefix, claude_args):
+    if term in ("Terminal", "iTerm"):
+        # macOS: AppleScript owns the window, so don't exec over the shell.
+        script_cmd = build_inner(directory, claude_args, env_prefix, use_exec=False)
+        if term == "Terminal":
+            osa = ('tell application "Terminal" to do script "%s"\n'
+                   'tell application "Terminal" to activate'
+                   % applescript_quote(script_cmd))
+        else:
+            osa = ('tell application "iTerm"\n'
+                   '  create window with default profile command "%s"\n'
+                   '  activate\n'
+                   'end tell' % applescript_quote(
+                       "%s -l -c %s" % (login_shell(), shq(script_cmd))))
+        return ["osascript", "-e", osa]
+
+    inner = build_inner(directory, claude_args, env_prefix, use_exec=True)
+    sh = [login_shell(), "-l", "-c", inner]
+    for name, flags in LINUX_TERMINALS:
+        if name == term:
+            return [term] + flags(directory) + sh
+    die("don't know how to drive terminal %r" % term)
+
+
+def main(argv):
+    profile = None
+    forced_term = os.environ.get("CLAUDE_TERMINAL")
+    dry_run = False
+    directory = None
+    name_override = None
+    no_name = False
+    claude_args = []
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__.rstrip())
+            print("\nclaude-code-cli-tools %s" % __version__)
+            return 0
+        elif a in ("-v", "--version"):
+            print("claude-code-cli-tools %s" % __version__)
+            return 0
+        elif a == "--update":
+            return do_update(check_only="--check" in argv,
+                             assume_yes="--yes" in argv or "-y" in argv)
+        elif a == "--profiles":
+            return print_profiles()
+        elif a == "--list":
+            return print_projects()
+        elif a == "--shell-init":
+            return print_shell_init()
+        elif a == "--profile":
+            i += 1
+            if i >= len(argv):
+                die("--profile needs a value")
+            profile = argv[i]
+        elif a.startswith("--profile="):
+            profile = a.split("=", 1)[1]
+        elif a == "--terminal":
+            i += 1
+            if i >= len(argv):
+                die("--terminal needs a value")
+            forced_term = argv[i]
+        elif a.startswith("--terminal="):
+            forced_term = a.split("=", 1)[1]
+        elif a in ("-n", "--name"):
+            i += 1
+            if i >= len(argv):
+                die("%s needs a value" % a)
+            name_override = argv[i]
+        elif a.startswith("--name="):
+            name_override = a.split("=", 1)[1]
+        elif a == "--no-name":
+            no_name = True
+        elif a == "--dry-run":
+            dry_run = True
+        elif a == "--":
+            claude_args.extend(argv[i + 1:])
+            break
+        elif directory is None and not a.startswith("-"):
+            directory = a
+        else:
+            claude_args.append(a)
+        i += 1
+
+    directory = resolve_dir(directory or os.getcwd())
+    cfg = config_dir(profile)
+    cfg_json = config_json_path(cfg)
+
+    if not dry_run:
+        os.makedirs(directory, exist_ok=True)
+    elif not os.path.isdir(directory):
+        print("(would create %s)" % directory)
+
+    # The new window must land in the same profile, so carry CLAUDE_CONFIG_DIR
+    # through unless this is the plain default profile (which needs no env).
+    from claude_profile_lib import DEFAULT_DIR
+    env_prefix = ""
+    if os.path.realpath(cfg) != os.path.realpath(DEFAULT_DIR):
+        env_prefix = "export CLAUDE_CONFIG_DIR=%s" % shq(cfg)
+
+    # Name the session unless the caller already passed their own -n/--name.
+    # Track the generated default separately: it also becomes --remote-control's
+    # argument below, but only when it's the auto-generated name, not an
+    # explicit --name override.
+    remote_control_name = None
+    if not no_name and not has_name_arg(claude_args):
+        name = name_override or session_name(directory)
+        claude_args = ["-n", name] + claude_args
+        if name_override is None:
+            remote_control_name = name
+
+    # Always enable Remote Control, unless the caller already passed their own
+    # --remote-control. Give it an explicit name only in the plain-default case
+    # above; otherwise leave it bare so claude's own name resolution applies
+    # (the caller's own -n/--name, or claude's hostname-prefixed auto name).
+    if not has_remote_control_arg(claude_args):
+        if remote_control_name is not None:
+            claude_args = ["--remote-control", remote_control_name] + claude_args
+        else:
+            claude_args = ["--remote-control"] + claude_args
+
+    term = pick_terminal(forced_term)
+    argv_out = build_argv(term, directory, env_prefix, claude_args)
+
+    if dry_run:
+        print("profile config : %s" % cfg)
+        print("config json    : %s" % cfg_json)
+        print("directory      : %s" % directory)
+        print("terminal       : %s" % term)
+        print("would exec     : %s" % argv_out)
+        return 0
+
+    newly = trust_dir(cfg_json, directory)
+    print("%s %s" % ("trusted:" if newly else "already trusted:", directory))
+
+    try:
+        subprocess.Popen(
+            argv_out,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as e:
+        die("failed to launch %s: %s" % (term, e))
+    print("launched %s in %s" % (term, directory))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
