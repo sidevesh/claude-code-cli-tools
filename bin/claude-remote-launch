@@ -22,6 +22,10 @@ Options:
   --shell-init      print per-profile alias definitions for eval, then exit
   --profile NAME    e.g. default or work  (else honours $CLAUDE_CONFIG_DIR)
   --terminal NAME   force a terminal emulator (else $CLAUDE_TERMINAL, else auto)
+  --here            run Claude in this terminal instead of opening a new one
+  --continue-if-available
+                    continue this profile's latest project conversation when
+                    one exists; otherwise start a new session
   -n, --name NAME   override the session name
   --no-name         don't name the session at all
   --dry-run         print what would run, change nothing
@@ -73,7 +77,7 @@ else:
     raise SystemExit(1)
 from claude_profile_lib import (  # noqa: E402
     __version__, config_dir, config_json_path, die, do_update, print_profiles,
-    print_projects, print_shell_init, resolve_dir, trust_dir,
+    has_conversation, print_projects, print_shell_init, resolve_dir, trust_dir,
 )
 
 try:
@@ -129,6 +133,15 @@ def has_name_arg(args):
 def has_remote_control_arg(args):
     for a in args:
         if a == "--remote-control" or a.startswith("--remote-control="):
+            return True
+    return False
+
+
+def has_session_selection_arg(args):
+    for a in args:
+        if a in ("-c", "--continue", "-r", "--resume"):
+            return True
+        if a.startswith("--resume="):
             return True
     return False
 
@@ -209,7 +222,10 @@ def build_argv(term, directory, env_prefix, claude_args):
 def main(argv):
     profile = None
     forced_term = os.environ.get("CLAUDE_TERMINAL")
+    terminal_explicit = False
     dry_run = False
+    run_here = False
+    continue_if_available = False
     directory = None
     name_override = None
     no_name = False
@@ -246,8 +262,14 @@ def main(argv):
             if i >= len(argv):
                 die("--terminal needs a value")
             forced_term = argv[i]
+            terminal_explicit = True
         elif a.startswith("--terminal="):
             forced_term = a.split("=", 1)[1]
+            terminal_explicit = True
+        elif a == "--here":
+            run_here = True
+        elif a == "--continue-if-available":
+            continue_if_available = True
         elif a in ("-n", "--name"):
             i += 1
             if i >= len(argv):
@@ -271,6 +293,9 @@ def main(argv):
     directory = resolve_dir(directory or os.getcwd())
     cfg = config_dir(profile)
     cfg_json = config_json_path(cfg)
+
+    if run_here and terminal_explicit:
+        die("--here and --terminal cannot be used together")
 
     if not dry_run:
         os.makedirs(directory, exist_ok=True)
@@ -305,8 +330,14 @@ def main(argv):
         else:
             claude_args = ["--remote-control"] + claude_args
 
-    term = pick_terminal(forced_term)
-    argv_out = build_argv(term, directory, env_prefix, claude_args)
+    if (continue_if_available and
+            not has_session_selection_arg(claude_args) and
+            has_conversation(cfg, directory)):
+        claude_args = ["--continue"] + claude_args
+
+    term = "current terminal" if run_here else pick_terminal(forced_term)
+    argv_out = ["claude"] + claude_args if run_here else build_argv(
+        term, directory, env_prefix, claude_args)
 
     if dry_run:
         print("profile config : %s" % cfg)
@@ -318,6 +349,16 @@ def main(argv):
 
     newly = trust_dir(cfg_json, directory)
     print("%s %s" % ("trusted:" if newly else "already trusted:", directory))
+
+    if run_here:
+        os.chdir(directory)
+        if env_prefix:
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+        try:
+            sys.stdout.flush()
+            os.execvp(argv_out[0], argv_out)
+        except OSError as e:
+            die("failed to launch Claude in current terminal: %s" % e)
 
     try:
         subprocess.Popen(

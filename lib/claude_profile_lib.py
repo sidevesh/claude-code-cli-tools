@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover
 
 #: Single source of truth for the version. Both commands report it, and both
 #: are updated together since they share this module.
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 REPO_SLUG = "sidevesh/claude-code-cli-tools"
 
@@ -261,6 +261,38 @@ def list_projects(cfg_dir):
             "exact": exact,
         }
     return out
+
+
+def has_conversation(cfg_dir, abs_path):
+    """Whether this profile has a transcript for exactly ``abs_path``.
+
+    Claude's project-directory slug is lossy, so the directory existing is not
+    enough: inspect each transcript's recorded cwd to avoid resuming a different
+    project whose path happens to collapse to the same slug.
+    """
+    wanted = os.path.realpath(abs_path)
+    project_path = os.path.join(projects_dir(cfg_dir), path_to_slug(wanted))
+    if not os.path.isdir(project_path):
+        return False
+    for name in os.listdir(project_path):
+        if not name.endswith(".jsonl"):
+            continue
+        try:
+            with open(os.path.join(project_path, name), "rb") as f:
+                for _ in range(200):
+                    line = f.readline()
+                    if not line:
+                        break
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    cwd = obj.get("cwd")
+                    if cwd and os.path.realpath(cwd) == wanted:
+                        return True
+        except (OSError, IOError):
+            continue
+    return False
 
 
 # ---------------------------------------------------------------- trust

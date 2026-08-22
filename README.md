@@ -64,6 +64,8 @@ claude-remote-launch --shell-init             # per-profile aliases, for eval
 claude-remote-launch ~/Projects/foo
 claude-remote-launch ~/Projects/foo --model opus
 claude-remote-launch --profile work ~/Projects/foo
+claude-remote-launch --here ~/Projects/foo     # use the current terminal/pane
+claude-remote-launch --here --continue-if-available ~/Projects/foo
 claude-remote-launch --dry-run ~/Projects/foo   # print the plan, change nothing
 ```
 
@@ -74,6 +76,8 @@ claude-remote-launch --dry-run ~/Projects/foo   # print the plan, change nothing
 | `--shell-init` | print per-profile alias definitions for `eval`, then exit |
 | `--profile NAME` | which config profile to use (else `$CLAUDE_CONFIG_DIR`, else default) |
 | `--terminal NAME` | force a terminal emulator (else `$CLAUDE_TERMINAL`, else auto-detect) |
+| `--here` | run Claude in the current terminal instead of opening a new terminal window |
+| `--continue-if-available` | continue the latest conversation for this project and profile when one exists; otherwise start a new session |
 | `-n`, `--name NAME` | override the session name |
 | `--no-name` | don't name the session |
 | `--dry-run` | print what would run, change nothing |
@@ -81,6 +85,16 @@ claude-remote-launch --dry-run ~/Projects/foo   # print the plan, change nothing
 | `-v`, `--version` | print version and exit |
 
 Unrecognised arguments are passed straight through to `claude`.
+
+`--here` is useful in tmux panes, SSH sessions, IDE terminals and scripts that
+already control terminal placement. It performs the same profile selection,
+workspace trust, session naming and Remote Control setup as the normal launcher,
+then replaces itself with Claude in the current terminal.
+
+`--continue-if-available` differs from passing `--continue` directly: it checks
+for an existing transcript belonging to the exact directory in the selected
+profile first. With no matching conversation it starts a new named session
+instead of exiting with `No conversation found to continue`.
 
 ### Skipping the trust prompt
 
