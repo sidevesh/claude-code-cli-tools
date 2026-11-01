@@ -3,8 +3,8 @@
 Cross-platform (Linux + macOS), Python 3.6+. Kept dependency-free on purpose so
 these tools work on a bare system with only python3 available.
 
-This module is the single source of truth for the version number; both commands
-report it and both are updated together, since they share this file and a
+This module is the single source of truth for the version number; all commands
+report it and are updated together, since they share this file and a
 mismatched pair would be a broken install.
 """
 
@@ -20,9 +20,9 @@ try:
 except ImportError:  # pragma: no cover
     from pipes import quote as _shq  # type: ignore
 
-#: Single source of truth for the version. Both commands report it, and both
+#: Single source of truth for the version. All commands report it, and all
 #: are updated together since they share this module.
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 REPO_SLUG = "sidevesh/claude-code-cli-tools"
 
@@ -40,7 +40,7 @@ LIB_SUBDIR = "claude-code-cli-tools"
 # ---------------------------------------------------------------- profiles
 
 # Profiles are a naming convention, not a fixed list: "default" is ~/.claude and
-# any other name X is ~/.claude-X. So a `CLAUDE_CONFIG_DIR=~/.claude-work claude`
+# any other name X is ~/.claude-X. So a `CLAUDE_CONFIG_DIR=~/.claude-NAME claude`
 # alias is automatically the "work" profile with no configuration here.
 DEFAULT_PROFILE = "default"
 DEFAULT_DIR = os.path.expanduser("~/.claude")
@@ -98,6 +98,145 @@ def config_json_path(cfg_dir):
 
 def projects_dir(cfg_dir):
     return os.path.join(cfg_dir, "projects")
+
+
+def _transcript_cwd(path):
+    """Return the cwd recorded near the start of a Claude transcript."""
+    try:
+        with open(path, "rb") as handle:
+            for _ in range(200):
+                line = handle.readline()
+                if not line:
+                    break
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                cwd = obj.get("cwd")
+                if isinstance(cwd, str) and cwd:
+                    return resolve_dir(cwd)
+    except (OSError, IOError):
+        pass
+    return None
+
+
+def _profile_name_for_dir(cfg_dir):
+    wanted = os.path.realpath(cfg_dir)
+    for name, discovered in discover_profiles().items():
+        if os.path.realpath(discovered) == wanted:
+            return name
+    return cfg_dir
+
+
+def _project_is_registered(cfg_dir, project_dir):
+    """Whether *project_dir* has a projects entry in this profile's JSON."""
+    if not project_dir:
+        return False
+    wanted = os.path.realpath(resolve_dir(project_dir))
+    data = load_json(config_json_path(cfg_dir))
+    projects = data.get("projects", {})
+    if not isinstance(projects, dict):
+        return False
+    for path in projects:
+        if isinstance(path, str) and os.path.realpath(resolve_dir(path)) == wanted:
+            return True
+    return False
+
+
+def prompt_session_profile(session_id, profile_dirs, input_stream=None,
+                           output_stream=None):
+    """Ask which profile owns an ambiguous copied Claude session."""
+    input_stream = input_stream or sys.stdin
+    output_stream = output_stream or sys.stderr
+    if not getattr(input_stream, "isatty", lambda: False)():
+        die("Claude session %s exists in multiple profiles (%s), and no interactive "
+            "terminal is available to choose one. Remove the duplicate project/session "
+            "from the profile that should not own it, then restart Herdr."
+            % (session_id, ", ".join(_profile_name_for_dir(p)
+                                     for p in profile_dirs)))
+
+    output_stream.write(
+        "\nClaude session %s exists in multiple profiles:\n" % session_id)
+    for index, cfg_dir in enumerate(profile_dirs, 1):
+        output_stream.write("  %d. %s  (%s)\n" %
+                            (index, _profile_name_for_dir(cfg_dir), cfg_dir))
+    output_stream.write(
+        "\nThis usually means the project or transcript was copied between profiles.\n"
+        "Choose the profile to use now. Remove the duplicate from the other profile\n"
+        "afterward so this question does not appear on every Herdr start.\n")
+    output_stream.flush()
+
+    while True:
+        output_stream.write("Profile [1-%d]: " % len(profile_dirs))
+        output_stream.flush()
+        answer = input_stream.readline()
+        if not answer:
+            die("profile selection was cancelled")
+        try:
+            choice = int(answer.strip())
+        except ValueError:
+            choice = 0
+        if 1 <= choice <= len(profile_dirs):
+            return profile_dirs[choice - 1]
+        output_stream.write("Enter a number from 1 to %d.\n" % len(profile_dirs))
+
+
+def session_profile_dir(session_id, cwd=None):
+    """Find the Claude config directory that owns *session_id*.
+
+    Claude stores a main session as ``<config>/projects/**/<id>.jsonl``.  Herdr
+    restores only the id, so locating that transcript recovers the
+    CLAUDE_CONFIG_DIR that the original process used.
+
+    A copied profile can contain the same id more than once. Prefer an exact
+    transcript cwd match, then the sole profile whose .claude.json registers
+    that project. Ask in the pane when a fully copied session is still
+    ambiguous rather than silently resuming it with the wrong account.
+
+    Returns ``None`` when no discovered profile contains the session.
+    """
+    if not session_id or os.path.basename(session_id) != session_id:
+        return None
+    filename = session_id + ".jsonl"
+    candidates = []
+    for _name, cfg_dir in discover_profiles().items():
+        root = projects_dir(cfg_dir)
+        if not os.path.isdir(root):
+            continue
+        for project_root, _dirs, files in os.walk(root):
+            if filename in files:
+                path = os.path.join(project_root, filename)
+                candidates.append((cfg_dir, path, _transcript_cwd(path)))
+
+    if not candidates:
+        return None
+
+    wanted_cwd = resolve_dir(cwd) if cwd else None
+    if wanted_cwd:
+        cwd_matches = [item for item in candidates
+                       if item[2] and os.path.realpath(item[2]) == os.path.realpath(wanted_cwd)]
+        if cwd_matches:
+            candidates = cwd_matches
+
+    unique_dirs = []
+    for cfg_dir, _path, _cwd in candidates:
+        if not any(os.path.realpath(cfg_dir) == os.path.realpath(existing)
+                   for existing in unique_dirs):
+            unique_dirs.append(cfg_dir)
+    if len(unique_dirs) == 1:
+        return unique_dirs[0]
+
+    project_dir = wanted_cwd
+    if not project_dir:
+        recorded_cwds = set(item[2] for item in candidates if item[2])
+        if len(recorded_cwds) == 1:
+            project_dir = next(iter(recorded_cwds))
+    registered = [cfg_dir for cfg_dir in unique_dirs
+                  if _project_is_registered(cfg_dir, project_dir)]
+    if len(registered) == 1:
+        return registered[0]
+
+    return prompt_session_profile(session_id, unique_dirs)
 
 
 # ---------------------------------------------------------------- json io
@@ -461,6 +600,27 @@ def is_git_checkout():
 
 #: version-that-introduces-the-change -> callable, e.g. {(1, 1, 0): _migrate_110}.
 #: Keep them idempotent: an interrupted update may re-run one.
+def install_extras():
+    """Install the Herdr launcher entry point and its private Claude shim."""
+    bin_dir, lib_dir = install_root()
+    launcher = os.path.join(bin_dir, "claude-remote-launch")
+    entries = [
+        (os.path.join(bin_dir, "herdr-launch"), launcher),
+        (os.path.join(lib_dir, "herdr-bin", "claude"), launcher),
+    ]
+    for link, target in entries:
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        tmp = link + ".tmp.%s" % os.getpid()
+        try:
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
+            os.symlink(target, tmp)
+            os.replace(tmp, link)
+        finally:
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
+
+
 MIGRATIONS = {}
 
 
@@ -493,6 +653,7 @@ def _run_new_migrations(lib_target, from_v, to_v):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         mod.apply_migrations(from_v, to_v)
+        mod.install_extras()
     except Exception as e:
         warn("could not run migrations for the new version: %s" % e)
         warn("the update itself succeeded; re-run --update if problems appear")

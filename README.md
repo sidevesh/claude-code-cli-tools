@@ -1,11 +1,12 @@
 # claude-code-cli-tools
 
-Two small CLI tools for [Claude Code](https://claude.com/claude-code):
+Three small CLI tools for [Claude Code](https://claude.com/claude-code) and Herdr:
 
 - **`claude-remote-launch`** — open a new terminal window running Claude Code in a directory, skipping the workspace trust prompt, with the session auto-named so it's identifiable in the Remote Control session list.
 - **`claude-profile-move`** — list, compare and move projects between Claude Code config profiles.
+- **`herdr-launch`** — launch a mixed-agent Herdr session whose Claude panes independently retain their original profile, standard names, and Remote Control across native session restore.
 
-Both are dependency-free Python 3, and work on Linux and macOS.
+All three are dependency-free Python 3, and work on Linux and macOS.
 
 > Tested against **Claude Code 2.1.228**. These tools read and write Claude Code's own config layout (`~/.claude.json`, `<config>/projects/`) and depend on flags like `claude -n` and `claude --remote-control`, so a future release could move things underneath them. If something misbehaves after an upgrade, check the layout before assuming a bug here.
 
@@ -17,12 +18,14 @@ curl -fsSL https://raw.githubusercontent.com/sidevesh/claude-code-cli-tools/main
 
 Always installs the latest released tag. Run it again to upgrade — it detects an existing install and asks first.
 
-Exactly three files land on your system, and nothing is written to your working directory (downloads are staged in a temp dir that is removed on exit):
+Three payload files and two Herdr entry-point symlinks land on your system, and nothing is written to your working directory (downloads are staged in a temp dir that is removed on exit):
 
 ```
 ~/.local/bin/claude-remote-launch
 ~/.local/bin/claude-profile-move
+~/.local/bin/herdr-launch -> ~/.local/bin/claude-remote-launch
 ~/.local/lib/claude-code-cli-tools/claude_profile_lib.py
+~/.local/lib/claude-code-cli-tools/herdr-bin/claude -> ~/.local/bin/claude-remote-launch
 ```
 
 The shared module is deliberately **not** in `bin/` — that directory goes on your `PATH` and should contain nothing but commands. Each script locates the module relative to its own resolved path, so both the installed layout and a git checkout work.
@@ -50,7 +53,7 @@ claude-remote-launch --update             # install it (prompts first)
 claude-remote-launch --update -y          # no prompt
 ```
 
-Both commands accept `--update`, and either one updates **all three files together** — they share a module, so a half-updated install would be a broken one. Updates are staged fully before anything is replaced, and each file is swapped in atomically, so an interrupted download leaves your existing install untouched. Version numbers are single-sourced from the shared module, and future releases can register migrations there if an update ever needs to change on-disk state.
+All three commands accept `--update`, and any one updates **all three payload files together** — they share a module, so a half-updated install would be a broken one. Updates are staged fully before anything is replaced, and each file is swapped in atomically, so an interrupted download leaves your existing install untouched. Version numbers are single-sourced from the shared module, and future releases can register migrations there if an update ever needs to change on-disk state.
 
 Running from a git checkout, `--update` refuses and tells you to `git pull` instead.
 
@@ -63,7 +66,7 @@ claude-remote-launch --list                   # list known projects
 claude-remote-launch --shell-init             # per-profile aliases, for eval
 claude-remote-launch ~/Projects/foo
 claude-remote-launch ~/Projects/foo --model opus
-claude-remote-launch --profile work ~/Projects/foo
+claude-remote-launch --profile NAME ~/Projects/foo
 claude-remote-launch --here ~/Projects/foo     # use the current terminal/pane
 claude-remote-launch --here --continue-if-available ~/Projects/foo
 claude-remote-launch --dry-run ~/Projects/foo   # print the plan, change nothing
@@ -81,7 +84,7 @@ claude-remote-launch --dry-run ~/Projects/foo   # print the plan, change nothing
 | `-n`, `--name NAME` | override the session name |
 | `--no-name` | don't name the session |
 | `--dry-run` | print what would run, change nothing |
-| `--update [--check]` | update all three files; `--check` only reports |
+| `--update [--check]` | update all tools; `--check` only reports |
 | `-v`, `--version` | print version and exit |
 
 Unrecognised arguments are passed straight through to `claude`.
@@ -126,15 +129,62 @@ Auto-detected, first match wins: `kgx`, `ptyxis`, `gnome-terminal`, `tilix`, `ko
 
 Force one with `--terminal` or `$CLAUDE_TERMINAL`.
 
+## `herdr-launch`
+
+Herdr normally restores Claude panes with `claude --resume <session-id>`, which
+does not retain a non-default `CLAUDE_CONFIG_DIR`, session naming, or Remote
+Control arguments. `herdr-launch` preserves all of them:
+
+```sh
+herdr-launch --session projects --claude-fallback-profile NAME
+```
+
+This starts or attaches to the Herdr named session `projects`. The session may
+contain Claude, OpenCode, Codex, ordinary shells, or any other process; only
+Claude commands are redirected. The launcher prepends a private `claude` shim
+to that Herdr server's `PATH` and then replaces itself with
+`herdr --session projects`. When Herdr starts or restores Claude in a pane, the
+shim routes its native command through `claude-remote-launch --here`. OpenCode,
+Codex, normal terminals, normal `claude` commands, and Herdr sessions launched
+another way are unaffected.
+
+The selected Claude profile is only the fallback for a new session or a resume
+whose transcript cannot yet be found. For normal restore, the shim searches all
+discovered profiles for `<config>/projects/**/<session-id>.jsonl` and uses the
+owning config directory. Different panes in the same Herdr session can therefore
+resume different Claude accounts. If copied profile data makes a session id
+ambiguous, the pane cwd and the project registration in each profile's
+`.claude.json` disambiguate it when possible. If a fully copied session is still
+ambiguous, that Claude pane pauses with an interactive profile chooser. The
+chooser reminds you to remove the duplicate afterward; if you leave both copies
+in place, it asks again on every Herdr start rather than silently choosing the
+wrong account.
+
+Start a new pane under the account you want once, for example with a generated
+`claude-<name>` alias or `claude-remote-launch --profile NAME --here`. After
+Claude creates its transcript, future Herdr restores infer that profile automatically.
+Install Herdr's Claude integration in every profile so each account reports its
+session identity. The first start after a full server stop or machine reboot
+must use `herdr-launch` so the new server inherits its private shim environment;
+ordinary Herdr clients may attach afterward while that server remains alive.
+
+| Option | |
+|---|---|
+| `--session NAME` | Herdr named session to launch or attach (required) |
+| `--claude-fallback-profile NAME` | Claude profile for new/unidentified sessions (else `$CLAUDE_CONFIG_DIR`, else the default profile) |
+| `--dry-run` | print the Herdr, fallback Claude profile, binary and shim that would be used |
+| `--update [--check]` | update all tools; `--check` only reports |
+| `-v`, `--version` | print version and exit |
+
 ## `claude-profile-move`
 
 ```sh
 claude-profile-move --profiles                # list config profiles
 claude-profile-move --list                    # all projects, by last-active
 claude-profile-move --dupes                   # projects present in >1 profile
-claude-profile-move ~/Projects/foo --to work
-claude-profile-move ~/Projects/foo --to default --copy
-claude-profile-move ~/Projects/foo --to work --dry-run
+claude-profile-move ~/Projects/foo --to NAME
+claude-profile-move ~/Projects/foo --to NAME --copy
+claude-profile-move ~/Projects/foo --to NAME --dry-run
 ```
 
 | Option | |
@@ -148,7 +198,7 @@ claude-profile-move ~/Projects/foo --to work --dry-run
 | `--prefer-newer` | on collision, keep the more recently active copy |
 | `--force` | on collision, overwrite the target |
 | `--dry-run` | print the plan, change nothing |
-| `--update [--check]` | update all three files; `--check` only reports |
+| `--update [--check]` | update all tools; `--check` only reports |
 | `-v`, `--version` | print version and exit |
 
 A project is **two** things, and both are moved together:
@@ -172,16 +222,18 @@ A profile is a naming convention, not a registry:
 So if you run a second profile with an alias like
 
 ```sh
-alias claude-work='CLAUDE_CONFIG_DIR=~/.claude-work claude'
+alias claude-NAME='CLAUDE_CONFIG_DIR=~/.claude-NAME claude'
 ```
 
-it is automatically the `work` profile — nothing to configure. Profiles are discovered by scanning for `~/.claude-*` directories. Either tool will list what it found:
+it is automatically the corresponding named profile — nothing to configure.
+Profiles are discovered by scanning for `~/.claude-*` directories. Either tool
+will list what it found:
 
 ```
 $ claude-profile-move --profiles
 PROFILE  PROJECTS  CONFIG DIR
 default  6         /home/you/.claude
-work     8         /home/you/.claude-work
+NAME     8         /home/you/.claude-NAME
 ```
 
 ### Shell integration
@@ -196,8 +248,8 @@ That defines `claude-<name>` and `claude-remote-launch-<name>` for every profile
 
 ```
 $ claude-remote-launch --shell-init
-alias claude-work='env CLAUDE_CONFIG_DIR=/home/you/.claude-work claude'
-alias claude-remote-launch-work='env CLAUDE_CONFIG_DIR=/home/you/.claude-work claude-remote-launch'
+alias claude-NAME='env CLAUDE_CONFIG_DIR=/home/you/.claude-NAME claude'
+alias claude-remote-launch-NAME='env CLAUDE_CONFIG_DIR=/home/you/.claude-NAME claude-remote-launch'
 ```
 
 Create a profile directory and the aliases appear in your next shell — no shell code to maintain. The generated aliases use `env VAR=... cmd` rather than a `VAR=... cmd` prefix, so they work in fish as well as bash and zsh.

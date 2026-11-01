@@ -5,8 +5,8 @@ directory, skipping the workspace trust prompt.
 Usage:
   claude-remote-launch [DIR] [-- claude args...]
   claude-remote-launch ~/Projects/foo --model opus
-  claude-remote-launch --profile work ~/Projects/foo
-  CLAUDE_CONFIG_DIR=~/.claude-work claude-remote-launch ~/Projects/foo
+  claude-remote-launch --profile NAME ~/Projects/foo
+  CLAUDE_CONFIG_DIR=~/.claude-NAME claude-remote-launch ~/Projects/foo
 
 Profiles are a naming convention: "default" is ~/.claude, any other name X is
 ~/.claude-X. Nothing to register.
@@ -20,7 +20,7 @@ Options:
   --profiles        list config profiles and exit
   --list            list known projects by last-active, and exit
   --shell-init      print per-profile alias definitions for eval, then exit
-  --profile NAME    e.g. default or work  (else honours $CLAUDE_CONFIG_DIR)
+  --profile NAME    config profile to use (else honours $CLAUDE_CONFIG_DIR)
   --terminal NAME   force a terminal emulator (else $CLAUDE_TERMINAL, else auto)
   --here            run Claude in this terminal instead of opening a new one
   --continue-if-available
@@ -29,7 +29,7 @@ Options:
   -n, --name NAME   override the session name
   --no-name         don't name the session at all
   --dry-run         print what would run, change nothing
-  --update [--check]  update both commands and the shared module; --check only
+  --update [--check]  update all commands and the shared module; --check only
                       reports whether an update exists. -y / --yes skips the
                       prompt (or set CLAUDE_CLI_TOOLS_ASSUME_YES=1).
   -v, --version     print version and exit
@@ -56,11 +56,14 @@ import shutil
 import subprocess
 import sys
 
+
+HERDR_REAL_CLAUDE_ENV = "CLAUDE_REMOTE_LAUNCH_REAL_CLAUDE"
+HERDR_SHIM_DIR_ENV = "CLAUDE_REMOTE_LAUNCH_HERDR_SHIM_DIR"
+
 # Locate the shared module. bin/ goes on PATH and must hold only executables,
 # so the module lives in a sibling lib/ - either <prefix>/lib/claude-code-cli-tools
 # (installed) or <repo>/lib (git checkout). realpath() resolves symlinks first.
-# Don't leave a __pycache__ beside the installed module: the install is meant
-# to be exactly three files. The module is small, so recompiling each run is
+# Don't leave a __pycache__ beside the installed module. The module is small, so recompiling each run is
 # cheaper than the clutter.
 sys.dont_write_bytecode = True
 
@@ -76,9 +79,115 @@ else:
     sys.stderr.write("error: claude_profile_lib.py not found; reinstall\n")
     raise SystemExit(1)
 from claude_profile_lib import (  # noqa: E402
-    __version__, config_dir, config_json_path, die, do_update, print_profiles,
-    has_conversation, print_projects, print_shell_init, resolve_dir, trust_dir,
+    DEFAULT_DIR, __version__, config_dir, config_json_path, die, do_update, print_profiles,
+    has_conversation, print_projects, print_shell_init, resolve_dir, session_profile_dir,
+    trust_dir,
 )
+
+
+HERDR_HELP = """herdr-launch - launch a multi-profile Claude-aware Herdr session.
+
+Usage:
+  herdr-launch --session NAME [--claude-fallback-profile NAME]
+
+The Herdr session may contain Claude, OpenCode, Codex, shells, or any other
+process. Only Claude commands are redirected: Herdr's native
+`claude --resume <id>` restore passes through claude-remote-launch. The owning
+Claude profile is inferred from the saved transcript across every discovered
+profile, so different panes can resume different accounts in one Herdr session.
+If a copied session is registered in multiple profiles, its pane asks which
+profile to use and reminds you to remove the duplicate before the next start.
+Project trust, session naming, and Remote Control are retained.
+
+Options:
+  --session NAME          Herdr named session to launch or attach
+  --claude-fallback-profile NAME
+                          Claude profile for new/unidentified sessions
+                          (else $CLAUDE_CONFIG_DIR, else the default profile)
+  --dry-run               print the launch plan without starting Herdr
+  --update [--check]      update every command in this package
+  -v, --version           print version and exit
+  -h, --help
+"""
+
+
+def herdr_main(argv):
+    session = None
+    profile = None
+    dry_run = False
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-h", "--help"):
+            print(HERDR_HELP.rstrip())
+            print("\nclaude-code-cli-tools %s" % __version__)
+            return 0
+        if arg in ("-v", "--version"):
+            print("claude-code-cli-tools %s" % __version__)
+            return 0
+        if arg == "--update":
+            return do_update(check_only="--check" in argv,
+                             assume_yes="--yes" in argv or "-y" in argv)
+        if arg == "--session":
+            i += 1
+            if i >= len(argv):
+                die("--session needs a name")
+            session = argv[i]
+        elif arg.startswith("--session="):
+            session = arg.split("=", 1)[1]
+        elif arg == "--claude-fallback-profile":
+            i += 1
+            if i >= len(argv):
+                die("--claude-fallback-profile needs a name")
+            profile = argv[i]
+        elif arg.startswith("--claude-fallback-profile="):
+            profile = arg.split("=", 1)[1]
+        elif arg == "--dry-run":
+            dry_run = True
+        elif arg not in ("--check", "--yes", "-y"):
+            die("unknown argument: %s" % arg)
+        i += 1
+
+    if not session:
+        die("--session is required")
+    if any(c.isspace() or ord(c) < 32 for c in session):
+        die("--session must not contain whitespace")
+
+    cfg = config_dir(profile)
+    real_claude = os.environ.get(HERDR_REAL_CLAUDE_ENV) or shutil.which("claude")
+    herdr = shutil.which("herdr")
+    if not real_claude:
+        die("claude was not found on PATH")
+    if not herdr:
+        die("herdr was not found on PATH")
+
+    shim_dir = os.environ.get(HERDR_SHIM_DIR_ENV)
+    if not shim_dir:
+        shim_dir = os.path.join(_prefix, "lib", "claude-code-cli-tools", "herdr-bin")
+    shim = os.path.join(shim_dir, "claude")
+    if not os.path.exists(shim):
+        die("Herdr Claude shim not found at %s; reinstall or update this tool" % shim)
+
+    herdr_argv = [herdr, "--session", session]
+    if dry_run:
+        print("Herdr session  : %s" % session)
+        print("Claude fallback: %s" % cfg)
+        print("Claude binary  : %s" % real_claude)
+        print("Claude shim    : %s" % shim)
+        print("would exec     : %s" % herdr_argv)
+        return 0
+
+    if os.path.realpath(cfg) == os.path.realpath(DEFAULT_DIR):
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        os.environ["CLAUDE_CONFIG_DIR"] = cfg
+    os.environ[HERDR_REAL_CLAUDE_ENV] = os.path.abspath(real_claude)
+    os.environ["PATH"] = shim_dir + os.pathsep + os.environ.get("PATH", "")
+    try:
+        os.execv(herdr, herdr_argv)
+    except OSError as exc:
+        die("failed to launch Herdr: %s" % exc)
 
 try:
     from shlex import quote as shq
@@ -144,6 +253,18 @@ def has_session_selection_arg(args):
         if a.startswith("--resume="):
             return True
     return False
+
+
+def resume_session_id(args):
+    """Return the session id selected by Claude's -r/--resume arguments."""
+    for index, arg in enumerate(args):
+        if arg in ("-r", "--resume"):
+            if index + 1 < len(args):
+                return args[index + 1]
+            return None
+        if arg.startswith("--resume="):
+            return arg.split("=", 1)[1]
+    return None
 
 
 def login_shell():
@@ -336,7 +457,8 @@ def main(argv):
         claude_args = ["--continue"] + claude_args
 
     term = "current terminal" if run_here else pick_terminal(forced_term)
-    argv_out = ["claude"] + claude_args if run_here else build_argv(
+    claude_command = os.environ.get(HERDR_REAL_CLAUDE_ENV) or "claude"
+    argv_out = [claude_command] + claude_args if run_here else build_argv(
         term, directory, env_prefix, claude_args)
 
     if dry_run:
@@ -374,4 +496,23 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    invoked_as = os.path.basename(sys.argv[0])
+    if invoked_as == "herdr-launch":
+        sys.exit(herdr_main(sys.argv[1:]))
+    if invoked_as == "claude":
+        if os.environ.get("HERDR_ENV") != "1":
+            die("this private Claude shim may only run inside Herdr")
+        real_claude = os.environ.get(HERDR_REAL_CLAUDE_ENV)
+        if not real_claude:
+            die("Herdr Claude shim is missing %s; start the session with herdr-launch"
+                % HERDR_REAL_CLAUDE_ENV)
+        resumed_id = resume_session_id(sys.argv[1:])
+        if resumed_id:
+            inferred_cfg = session_profile_dir(resumed_id, cwd=os.getcwd())
+            if inferred_cfg:
+                if os.path.realpath(inferred_cfg) == os.path.realpath(DEFAULT_DIR):
+                    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = inferred_cfg
+        sys.exit(main(["--here", os.getcwd(), "--"] + sys.argv[1:]))
     sys.exit(main(sys.argv[1:]))

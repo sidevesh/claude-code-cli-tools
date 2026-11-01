@@ -9,9 +9,9 @@ Usage:
   claude-profile-move --profiles                 list config profiles
   claude-profile-move --list                     all projects, with last-active
   claude-profile-move --dupes                    projects present in >1 profile
-  claude-profile-move PROJECT --to work          move (PROJECT = slug or path)
-  claude-profile-move PROJECT --to default --copy
-  claude-profile-move PROJECT --to work --dry-run
+  claude-profile-move PROJECT --to NAME          move (PROJECT = slug or path)
+  claude-profile-move PROJECT --to NAME --copy
+  claude-profile-move PROJECT --to NAME --dry-run
 
 Profiles are a naming convention: "default" is ~/.claude, any other name X is
 ~/.claude-X. Nothing to register.
@@ -22,13 +22,13 @@ Options:
   --profiles         list config profiles and exit
   --list             list all projects by last-active, and exit
   --dupes            list projects present in more than one profile, and exit
-  --to NAME          target profile, e.g. default or work  (required to move)
+  --to NAME          target profile (required to move)
   --from NAME        source profile (default: whichever profile has it)
   --copy             copy instead of move
   --prefer-newer     on collision keep the more recently active copy
   --force            on collision overwrite the target
   --dry-run          print the plan, change nothing
-  --update [--check] update both commands and the shared module; --check only
+  --update [--check] update all commands and the shared module; --check only
                      reports whether an update exists. -y / --yes skips the
                      prompt (or set CLAUDE_CLI_TOOLS_ASSUME_YES=1).
   -v, --version      print version and exit
@@ -47,7 +47,7 @@ import sys
 # so the module lives in a sibling lib/ - either <prefix>/lib/claude-code-cli-tools
 # (installed) or <repo>/lib (git checkout). realpath() resolves symlinks first.
 # Don't leave a __pycache__ beside the installed module: the install is meant
-# to be exactly three files. The module is small, so recompiling each run is
+# to stay free of cache files. The module is small, so recompiling each run is
 # cheaper than the clutter.
 sys.dont_write_bytecode = True
 
@@ -145,7 +145,7 @@ def move_json_entry(src_json, dst_json, real_path, copy, dry):
 
 def cmd_move(ident, to_profile, from_profile, copy, prefer_newer, force, dry):
     if not to_profile:
-        die("--to is required (e.g. --to default, --to work)")
+        die("--to is required (use --to NAME)")
     if not os.path.isdir(profile_dir(to_profile)):
         die("unknown profile %r -> %s does not exist (known: %s)"
             % (to_profile, profile_dir(to_profile),

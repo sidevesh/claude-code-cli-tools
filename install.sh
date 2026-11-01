@@ -3,12 +3,14 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/sidevesh/claude-code-cli-tools/main/install.sh | sh
 #
-# Installs exactly three files and leaves nothing behind in the working
-# directory - everything is staged in a temp dir that is removed on exit:
+# Installs three payload files plus two Herdr entry-point symlinks. Everything is
+# staged in a temp dir that is removed on exit:
 #
 #   <prefix>/bin/claude-remote-launch
 #   <prefix>/bin/claude-profile-move
+#   <prefix>/bin/herdr-launch -> <prefix>/bin/claude-remote-launch
 #   <prefix>/lib/claude-code-cli-tools/claude_profile_lib.py
+#   <prefix>/lib/claude-code-cli-tools/herdr-bin/claude -> <prefix>/bin/claude-remote-launch
 #
 # Environment:
 #   PREFIX                        install root (default ~/.local)
@@ -123,6 +125,15 @@ install_file "$TMP/claude-remote-launch"  "$BINDIR/claude-remote-launch"  755
 install_file "$TMP/claude-profile-move"   "$BINDIR/claude-profile-move"   755
 install_file "$TMP/claude_profile_lib.py" "$LIBDIR/claude_profile_lib.py" 644
 
+# Herdr's native restore command is `claude --resume <id>`. This private PATH
+# entry redirects only Herdr sessions launched through herdr-launch back
+# through claude-remote-launch, inferring the original profile from the resume
+# id and preserving naming, trust and Remote Control without replacing the
+# user's normal `claude` command.
+mkdir -p "$LIBDIR/herdr-bin"
+ln -sfn "$BINDIR/claude-remote-launch" "$BINDIR/herdr-launch"
+ln -sfn "$BINDIR/claude-remote-launch" "$LIBDIR/herdr-bin/claude"
+
 say ""
 say "Installed $("$BINDIR/claude-remote-launch" --version 2>/dev/null || echo "claude-code-cli-tools")"
 
@@ -140,3 +151,4 @@ say "Optional - per-profile aliases, add to ~/.bashrc or ~/.zshrc:"
 say '    eval "$(claude-remote-launch --shell-init)"'
 say ""
 say "Try: claude-remote-launch --help"
+say "     herdr-launch --help"
