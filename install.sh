@@ -3,11 +3,12 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/sidevesh/claude-code-cli-tools/main/install.sh | sh
 #
-# Installs three payload files plus two Herdr entry-point symlinks. Everything is
+# Installs four payload files plus two Herdr entry-point symlinks. Everything is
 # staged in a temp dir that is removed on exit:
 #
 #   <prefix>/bin/claude-remote-launch
 #   <prefix>/bin/claude-profile-move
+#   <prefix>/bin/claude-herdr-resume-hook
 #   <prefix>/bin/herdr-launch -> <prefix>/bin/claude-remote-launch
 #   <prefix>/lib/claude-code-cli-tools/claude_profile_lib.py
 #   <prefix>/lib/claude-code-cli-tools/herdr-bin/claude -> <prefix>/bin/claude-remote-launch
@@ -104,7 +105,7 @@ trap 'rm -rf "$TMP"' EXIT INT TERM HUP
 
 RAW="https://raw.githubusercontent.com/$REPO/$REF"
 say ""
-for item in "bin/claude-remote-launch" "bin/claude-profile-move" "lib/claude_profile_lib.py"; do
+for item in "bin/claude-remote-launch" "bin/claude-profile-move" "bin/claude-herdr-resume-hook" "lib/claude_profile_lib.py"; do
     name=${item##*/}
     say "  downloading $name"
     fetch "$RAW/$item" > "$TMP/$name" || fail "download failed: $item"
@@ -133,6 +134,12 @@ install_file "$TMP/claude_profile_lib.py" "$LIBDIR/claude_profile_lib.py" 644
 mkdir -p "$LIBDIR/herdr-bin"
 ln -sfn "$BINDIR/claude-remote-launch" "$BINDIR/herdr-launch"
 ln -sfn "$BINDIR/claude-remote-launch" "$LIBDIR/herdr-bin/claude"
+
+# Register a separate companion hook in every discovered Claude profile. It
+# records a custom Herdr resume command containing the absolute router path, so
+# restores remain profile-aware even when an SSH peer starts Herdr after reboot
+# before herdr-launch has supplied its private PATH.
+"$BINDIR/claude-remote-launch" --install-herdr-hooks
 
 say ""
 say "Installed $("$BINDIR/claude-remote-launch" --version 2>/dev/null || echo "claude-code-cli-tools")"

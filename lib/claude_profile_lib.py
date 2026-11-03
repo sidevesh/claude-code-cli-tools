@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover
 
 #: Single source of truth for the version. All commands report it, and all
 #: are updated together since they share this module.
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 REPO_SLUG = "sidevesh/claude-code-cli-tools"
 
@@ -31,6 +31,7 @@ REPO_SLUG = "sidevesh/claude-code-cli-tools"
 PAYLOAD = (
     ("bin/claude-remote-launch", "bin"),
     ("bin/claude-profile-move", "bin"),
+    ("bin/claude-herdr-resume-hook", "bin"),
     ("lib/claude_profile_lib.py", "lib"),
 )
 
@@ -266,6 +267,62 @@ def save_json_atomic(path, data, mode=0o600):
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
+
+
+def install_herdr_resume_hooks():
+    """Register the reboot-safe Herdr resume hook in every Claude profile.
+
+    The hook is separate from Herdr's managed hook file, which an integration
+    update may replace. Re-running this function removes stale copies of our
+    own hook entry before adding the current absolute path.
+    """
+    bin_dir, _lib_dir = install_root()
+    hook_path = os.path.join(bin_dir, "claude-herdr-resume-hook")
+    if not os.path.isfile(hook_path):
+        die("Herdr resume hook not found at %s; reinstall" % hook_path)
+    command = _shq(hook_path)
+    installed = []
+    marker = "claude-herdr-resume-hook"
+
+    for _name, cfg_dir in discover_profiles().items():
+        settings_path = os.path.join(cfg_dir, "settings.json")
+        data = load_json(settings_path)
+        hooks = data.setdefault("hooks", {})
+        entries = hooks.setdefault("SessionStart", [])
+        if not isinstance(entries, list):
+            die("%s hooks.SessionStart is not a list" % settings_path)
+
+        cleaned = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                cleaned.append(entry)
+                continue
+            commands = entry.get("hooks")
+            if not isinstance(commands, list):
+                cleaned.append(entry)
+                continue
+            kept = []
+            for hook in commands:
+                hook_command = hook.get("command", "") if isinstance(hook, dict) else ""
+                if marker not in hook_command:
+                    kept.append(hook)
+            if kept:
+                copy = dict(entry)
+                copy["hooks"] = kept
+                cleaned.append(copy)
+
+        cleaned.append({
+            "matcher": "^(startup|resume|clear|compact|fork)$",
+            "hooks": [{
+                "type": "command",
+                "command": command,
+                "timeout": 10,
+            }],
+        })
+        hooks["SessionStart"] = cleaned
+        save_json_atomic(settings_path, data)
+        installed.append(settings_path)
+    return installed
 
 
 # ---------------------------------------------------------------- slugs
@@ -601,7 +658,7 @@ def is_git_checkout():
 #: version-that-introduces-the-change -> callable, e.g. {(1, 1, 0): _migrate_110}.
 #: Keep them idempotent: an interrupted update may re-run one.
 def install_extras():
-    """Install the Herdr launcher entry point and its private Claude shim."""
+    """Install Herdr entry points and register its durable resume hook."""
     bin_dir, lib_dir = install_root()
     launcher = os.path.join(bin_dir, "claude-remote-launch")
     entries = [
@@ -619,6 +676,7 @@ def install_extras():
         finally:
             if os.path.lexists(tmp):
                 os.unlink(tmp)
+    install_herdr_resume_hooks()
 
 
 MIGRATIONS = {}

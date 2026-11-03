@@ -59,6 +59,7 @@ import sys
 
 HERDR_REAL_CLAUDE_ENV = "CLAUDE_REMOTE_LAUNCH_REAL_CLAUDE"
 HERDR_SHIM_DIR_ENV = "CLAUDE_REMOTE_LAUNCH_HERDR_SHIM_DIR"
+HERDR_ROUTED_RESUME_ENV = "CLAUDE_REMOTE_LAUNCH_HERDR_RESUME"
 
 # Locate the shared module. bin/ goes on PATH and must hold only executables,
 # so the module lives in a sibling lib/ - either <prefix>/lib/claude-code-cli-tools
@@ -80,8 +81,8 @@ else:
     raise SystemExit(1)
 from claude_profile_lib import (  # noqa: E402
     DEFAULT_DIR, __version__, config_dir, config_json_path, die, do_update, print_profiles,
-    has_conversation, print_projects, print_shell_init, resolve_dir, session_profile_dir,
-    trust_dir,
+    has_conversation, install_herdr_resume_hooks, print_projects, print_shell_init,
+    resolve_dir, session_profile_dir, trust_dir,
 )
 
 
@@ -371,6 +372,11 @@ def main(argv):
             return print_projects()
         elif a == "--shell-init":
             return print_shell_init()
+        elif a == "--install-herdr-hooks":
+            paths = install_herdr_resume_hooks()
+            for path in paths:
+                print("installed Herdr resume hook: %s" % path)
+            return 0
         elif a == "--profile":
             i += 1
             if i >= len(argv):
@@ -515,4 +521,17 @@ if __name__ == "__main__":
                 else:
                     os.environ["CLAUDE_CONFIG_DIR"] = inferred_cfg
         sys.exit(main(["--here", os.getcwd(), "--"] + sys.argv[1:]))
+    if os.environ.get(HERDR_ROUTED_RESUME_ENV) == "1":
+        if os.environ.get("HERDR_ENV") != "1":
+            die("the Herdr resume router may only run inside Herdr")
+        resumed_id = resume_session_id(sys.argv[1:])
+        if not resumed_id:
+            die("the Herdr resume router requires --resume <session-id>")
+        inferred_cfg = session_profile_dir(resumed_id, cwd=os.getcwd())
+        if inferred_cfg:
+            if os.path.realpath(inferred_cfg) == os.path.realpath(DEFAULT_DIR):
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = inferred_cfg
+        sys.exit(main(sys.argv[1:]))
     sys.exit(main(sys.argv[1:]))

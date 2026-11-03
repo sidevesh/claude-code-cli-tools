@@ -2,9 +2,11 @@ import json
 import os
 import pathlib
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 
@@ -14,6 +16,7 @@ from claude_profile_lib import prompt_session_profile  # noqa: E402
 
 LAUNCHER = ROOT / "bin" / "claude-remote-launch"
 HERDR_LAUNCHER = ROOT / "bin" / "herdr-launch"
+HERDR_RESUME_HOOK = ROOT / "bin" / "claude-herdr-resume-hook"
 
 
 class RemoteLaunchHereTests(unittest.TestCase):
@@ -130,6 +133,27 @@ class RemoteLaunchHereTests(unittest.TestCase):
         self.assertEqual(result["config"], str(self.second_profile))
         self.assertIn("session-shubhi", result["argv"])
 
+    def test_durable_herdr_resume_infers_profile_without_private_path(self):
+        self.add_session(self.second_profile, "session-reboot", self.project)
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(self.home),
+            "PATH": str(self.bin) + os.pathsep + env.get("PATH", ""),
+            "CAPTURE": str(self.capture),
+            "HERDR_ENV": "1",
+            "CLAUDE_REMOTE_LAUNCH_HERDR_RESUME": "1",
+        })
+        subprocess.run(
+            [sys.executable, str(LAUNCHER), "--here", str(self.project),
+             "--", "--resume", "session-reboot"],
+            env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=str(self.project),
+        )
+        result = json.loads(self.capture.read_text())
+        self.assertEqual(result["config"], str(self.second_profile))
+        self.assertIn("--remote-control", result["argv"])
+        self.assertIn("session-reboot", result["argv"])
+
     def test_herdr_shim_uses_cwd_to_disambiguate_copied_session(self):
         other_project = self.root / "Projects" / "other"
         other_project.mkdir(parents=True)
@@ -228,6 +252,90 @@ class RemoteLaunchHereTests(unittest.TestCase):
         )
         self.assertIn("--claude-fallback-profile", proc.stdout)
         self.assertNotIn("--claude-profile ", proc.stdout)
+
+    def test_resume_hook_reports_absolute_profile_router_command(self):
+        socket_path = self.root / "herdr.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(socket_path))
+        server.listen(1)
+        captured = {}
+
+        def receive():
+            conn, _addr = server.accept()
+            with conn:
+                line = b""
+                while not line.endswith(b"\n"):
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    line += chunk
+                captured.update(json.loads(line.decode("utf-8")))
+                conn.sendall(b'{"id":"ok","result":{}}\n')
+            server.close()
+
+        receiver = threading.Thread(target=receive)
+        receiver.start()
+        env = os.environ.copy()
+        env.update({
+            "HERDR_ENV": "1",
+            "HERDR_SOCKET_PATH": str(socket_path),
+            "HERDR_PANE_ID": "w2:p1",
+        })
+        hook_input = {
+            "hook_event_name": "SessionStart",
+            "source": "resume",
+            "session_id": "session-hook",
+            "cwd": str(self.project),
+            "transcript_path": str(self.profile / "projects" / "x" /
+                                   "session-hook.jsonl"),
+        }
+        subprocess.run(
+            [sys.executable, str(HERDR_RESUME_HOOK)],
+            env=env, input=json.dumps(hook_input), check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        receiver.join(timeout=3)
+        self.assertFalse(receiver.is_alive())
+        self.assertEqual(captured["method"], "pane.report_agent_session")
+        params = captured["params"]
+        self.assertEqual(params["source"], "herdr:claude")
+        self.assertEqual(params["agent_session_id"], "session-hook")
+        self.assertEqual(params["session_start_source"], "resume")
+        self.assertIn("session-hook.jsonl", params["agent_session_path"])
+        self.assertIsInstance(params["seq"], int)
+        argv = params["resume_argv"]
+        self.assertEqual(argv[0:2],
+                         ["env", "CLAUDE_REMOTE_LAUNCH_HERDR_RESUME=1"])
+        self.assertEqual(argv[2], str(LAUNCHER.resolve()))
+        self.assertEqual(argv[-2:], ["--resume", "session-hook"])
+
+    def test_hook_registration_is_idempotent_and_preserves_other_hooks(self):
+        settings_path = self.profile / "settings.json"
+        settings_path.write_text(json.dumps({
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "startup",
+                    "hooks": [{"type": "command", "command": "keep-me"}],
+                }]
+            }
+        }))
+        env = os.environ.copy()
+        env["HOME"] = str(self.home)
+        for _ in range(2):
+            subprocess.run(
+                [sys.executable, str(LAUNCHER), "--install-herdr-hooks"],
+                env=env, check=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+        settings = json.loads(settings_path.read_text())
+        commands = [
+            hook.get("command", "")
+            for entry in settings["hooks"]["SessionStart"]
+            for hook in entry.get("hooks", [])
+        ]
+        self.assertIn("keep-me", commands)
+        self.assertEqual(sum("claude-herdr-resume-hook" in command
+                             for command in commands), 1)
 
 
 if __name__ == "__main__":

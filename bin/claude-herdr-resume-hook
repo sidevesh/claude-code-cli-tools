@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Record a reboot-safe, profile-aware Claude resume command in Herdr.
+
+Claude runs this as a SessionStart hook. Herdr's official hook reports the
+session id; this companion report adds resume_argv so a server started by a
+remote peer after reboot routes the resume through claude-remote-launch even
+when that server did not inherit herdr-launch's private PATH.
+"""
+
+import json
+import os
+import random
+import socket
+import sys
+import time
+
+
+ROUTED_RESUME_ENV = "CLAUDE_REMOTE_LAUNCH_HERDR_RESUME"
+
+
+def safe_argv(argv):
+    return (len(argv) <= 64 and
+            sum(len(item.encode("utf-8")) for item in argv) <= 8192 and
+            all("'" not in item and
+                not any(ord(char) < 32 for char in item)
+                for item in argv))
+
+
+def main():
+    try:
+        hook_input = json.load(sys.stdin)
+    except (ValueError, OSError):
+        return 0
+
+    if os.environ.get("HERDR_ENV") != "1":
+        return 0
+    socket_path = os.environ.get("HERDR_SOCKET_PATH")
+    pane_id = os.environ.get("HERDR_PANE_ID")
+    if not socket_path or not pane_id:
+        return 0
+    if hook_input.get("hook_event_name") != "SessionStart":
+        return 0
+    if hook_input.get("agent_id"):
+        return 0
+
+    session_id = hook_input.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return 0
+    cwd = hook_input.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        cwd = os.getcwd()
+
+    launcher = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                            "claude-remote-launch")
+    resume_argv = [
+        "env",
+        ROUTED_RESUME_ENV + "=1",
+        launcher,
+        "--here",
+        cwd,
+        "--",
+        "--resume",
+        session_id,
+    ]
+    if not safe_argv(resume_argv):
+        return 0
+
+    request = {
+        "id": "claude-remote-launch:%d:%06d" %
+              (int(time.time() * 1000), random.randrange(1_000_000)),
+        "method": "pane.report_agent_session",
+        "params": {
+            "pane_id": pane_id,
+            "source": "herdr:claude",
+            "agent": "claude",
+            "agent_session_id": session_id,
+            "resume_argv": resume_argv,
+        },
+    }
+    transcript_path = hook_input.get("transcript_path")
+    if isinstance(transcript_path, str) and transcript_path:
+        request["params"]["agent_session_path"] = transcript_path
+    session_start_source = hook_input.get("source")
+    if isinstance(session_start_source, str) and session_start_source:
+        request["params"]["session_start_source"] = session_start_source
+
+    # Claude may run matching SessionStart hooks concurrently. Let Herdr's
+    # official session-only hook report first, then enrich the same authority
+    # with the custom command so an argv-less report cannot win the race.
+    time.sleep(0.25)
+    request["params"]["seq"] = time.time_ns()
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.75)
+        client.connect(socket_path)
+        client.sendall((json.dumps(request) + "\n").encode("utf-8"))
+        try:
+            client.recv(4096)
+        except Exception:
+            pass
+        client.close()
+    except Exception:
+        # Hooks must never prevent Claude from starting.
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

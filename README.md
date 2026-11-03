@@ -18,17 +18,18 @@ curl -fsSL https://raw.githubusercontent.com/sidevesh/claude-code-cli-tools/main
 
 Always installs the latest released tag. Run it again to upgrade — it detects an existing install and asks first.
 
-Three payload files and two Herdr entry-point symlinks land on your system, and nothing is written to your working directory (downloads are staged in a temp dir that is removed on exit):
+Four payload files and two Herdr entry-point symlinks land on your system, and nothing is written to your working directory (downloads are staged in a temp dir that is removed on exit):
 
 ```
 ~/.local/bin/claude-remote-launch
 ~/.local/bin/claude-profile-move
+~/.local/bin/claude-herdr-resume-hook
 ~/.local/bin/herdr-launch -> ~/.local/bin/claude-remote-launch
 ~/.local/lib/claude-code-cli-tools/claude_profile_lib.py
 ~/.local/lib/claude-code-cli-tools/herdr-bin/claude -> ~/.local/bin/claude-remote-launch
 ```
 
-The shared module is deliberately **not** in `bin/` — that directory goes on your `PATH` and should contain nothing but commands. Each script locates the module relative to its own resolved path, so both the installed layout and a git checkout work.
+The shared module is deliberately **not** in `bin/` — that directory goes on your `PATH` and should contain nothing but commands. The Herdr hook is an internal executable invoked by Claude's `SessionStart` hook. Each script locates the module relative to its own resolved path, so both the installed layout and a git checkout work.
 
 | Environment variable | |
 |---|---|
@@ -164,9 +165,13 @@ Start a new pane under the account you want once, for example with a generated
 `claude-<name>` alias or `claude-remote-launch --profile NAME --here`. After
 Claude creates its transcript, future Herdr restores infer that profile automatically.
 Install Herdr's Claude integration in every profile so each account reports its
-session identity. The first start after a full server stop or machine reboot
-must use `herdr-launch` so the new server inherits its private shim environment;
-ordinary Herdr clients may attach afterward while that server remains alive.
+session identity. Installation of this package also adds a companion
+`SessionStart` hook to every discovered profile. That hook records a custom
+Herdr `resume_argv` which invokes the profile router by absolute path. After a
+session has started once with the hook installed, a full server restart or
+machine reboot can restore it correctly even if a saved SSH peer starts the
+Herdr server before `herdr-launch` runs locally. The private PATH shim remains
+as a compatibility path for sessions whose saved metadata predates the hook.
 
 | Option | |
 |---|---|
