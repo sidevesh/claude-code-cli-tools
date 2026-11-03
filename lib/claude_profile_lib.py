@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover
 
 #: Single source of truth for the version. All commands report it, and all
 #: are updated together since they share this module.
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 REPO_SLUG = "sidevesh/claude-code-cli-tools"
 

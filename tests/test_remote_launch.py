@@ -337,6 +337,42 @@ class RemoteLaunchHereTests(unittest.TestCase):
         self.assertEqual(sum("claude-herdr-resume-hook" in command
                              for command in commands), 1)
 
+    def test_fresh_installer_installs_and_registers_resume_hook(self):
+        prefix = self.root / "prefix"
+        fake_curl = self.bin / "curl"
+        fake_curl.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys\n"
+            "root = pathlib.Path(os.environ['FAKE_REPO_ROOT'])\n"
+            "name = sys.argv[-1].rsplit('/', 1)[-1]\n"
+            "path = root / ('lib' if name == 'claude_profile_lib.py' else 'bin') / name\n"
+            "sys.stdout.buffer.write(path.read_bytes())\n"
+        )
+        fake_curl.chmod(0o755)
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(self.home),
+            "PATH": str(self.bin) + os.pathsep + env.get("PATH", ""),
+            "PREFIX": str(prefix),
+            "CLAUDE_CLI_TOOLS_REF": "test",
+            "FAKE_REPO_ROOT": str(ROOT),
+        })
+        subprocess.run(
+            ["sh", str(ROOT / "install.sh")], env=env, check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        installed_hook = prefix / "bin" / "claude-herdr-resume-hook"
+        self.assertTrue(installed_hook.is_file())
+        self.assertTrue(os.access(installed_hook, os.X_OK))
+        settings = json.loads((self.profile / "settings.json").read_text())
+        commands = [
+            hook.get("command", "")
+            for entry in settings["hooks"]["SessionStart"]
+            for hook in entry.get("hooks", [])
+        ]
+        self.assertEqual(sum(str(installed_hook) in command
+                             for command in commands), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

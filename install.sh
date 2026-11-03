@@ -124,6 +124,7 @@ install_file() {  # src dst mode   (install(1) differs across platforms; do it b
 }
 install_file "$TMP/claude-remote-launch"  "$BINDIR/claude-remote-launch"  755
 install_file "$TMP/claude-profile-move"   "$BINDIR/claude-profile-move"   755
+install_file "$TMP/claude-herdr-resume-hook" "$BINDIR/claude-herdr-resume-hook" 755
 install_file "$TMP/claude_profile_lib.py" "$LIBDIR/claude_profile_lib.py" 644
 
 # Herdr's native restore command is `claude --resume <id>`. This private PATH
